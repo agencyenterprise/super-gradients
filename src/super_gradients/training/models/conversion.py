@@ -56,6 +56,103 @@ class ConvertableCompletePipelineModel(torch.nn.Module):
         return self.post_process(self.model(self.pre_process(x)))
 
 
+def pipeline_coreml(model, weights_dir=None):
+    import coremltools as ct
+
+    _, _, h, w = 0, 0, 640, 640
+
+    # Output shapes
+    spec = model.get_spec()
+    print(spec.description.output)
+    out0, out1 = iter(spec.description.output)
+
+    from PIL import Image
+    img = Image.new('RGB', (w, h))  # w=192, h=320
+    out = model.predict({'x_1': img})
+    out0_shape = out[out0.name].shape  # (8400, 4)
+    out1_shape = out[out1.name].shape  # (8400, 2)
+
+    # Checks
+    names = ["hoop", "score"]
+    nx, ny = spec.description.input[0].type.imageType.width, spec.description.input[0].type.imageType.height
+    nc = 2
+    assert len(names) == nc, f'{len(names)} names found for nc={nc}'  # check
+
+    # Define output shapes (missing)
+    out0.type.multiArrayType.shape[:] = out0_shape  # (8400, 4)
+    out1.type.multiArrayType.shape[:] = out1_shape  # (8400, 2)
+
+    # Model from spec
+    model = ct.models.MLModel(spec, weights_dir=weights_dir)
+
+    # 3. Create NMS protobuf
+    nms_spec = ct.proto.Model_pb2.Model()
+    nms_spec.specificationVersion = 5
+    for i in range(2):
+        decoder_output = model._spec.description.output[i].SerializeToString()
+        nms_spec.description.input.add()
+        nms_spec.description.input[i].ParseFromString(decoder_output)
+        nms_spec.description.output.add()
+        nms_spec.description.output[i].ParseFromString(decoder_output)
+
+    nms_spec.description.output[0].name = 'confidence'
+    nms_spec.description.output[1].name = 'coordinates'
+
+    output_sizes = [nc, 4]
+    for i in range(2):
+        ma_type = nms_spec.description.output[i].type.multiArrayType
+        ma_type.shapeRange.sizeRanges.add()
+        ma_type.shapeRange.sizeRanges[0].lowerBound = 0
+        ma_type.shapeRange.sizeRanges[0].upperBound = -1
+        ma_type.shapeRange.sizeRanges.add()
+        ma_type.shapeRange.sizeRanges[1].lowerBound = output_sizes[i]
+        ma_type.shapeRange.sizeRanges[1].upperBound = output_sizes[i]
+        del ma_type.shape[:]
+
+    nms = nms_spec.nonMaximumSuppression
+    nms.confidenceInputFeatureName = out1.name  # 1x507x80
+    nms.coordinatesInputFeatureName = out0.name  # 1x507x4
+    nms.confidenceOutputFeatureName = 'confidence'
+    nms.coordinatesOutputFeatureName = 'coordinates'
+    nms.iouThresholdInputFeatureName = 'iouThreshold'
+    nms.confidenceThresholdInputFeatureName = 'confidenceThreshold'
+    nms.iouThreshold = 0.45
+    nms.confidenceThreshold = 0.25
+    nms.pickTop.perClass = False
+    nms.stringClassLabels.vector.extend(names)
+    nms_model = ct.models.MLModel(nms_spec)
+
+    # 4. Pipeline models together
+    pipeline = ct.models.pipeline.Pipeline(input_features=[('x_1', ct.models.datatypes.Array(3, ny, nx)),
+                                                            ('iouThreshold', ct.models.datatypes.Double()),
+                                                            ('confidenceThreshold', ct.models.datatypes.Double())],
+                                            output_features=['confidence', 'coordinates'])
+
+    pipeline.add_model(model)
+    pipeline.add_model(nms_model)
+
+    # Correct datatypes
+    pipeline.spec.description.input[0].ParseFromString(model._spec.description.input[0].SerializeToString())
+    pipeline.spec.description.output[0].ParseFromString(nms_model._spec.description.output[0].SerializeToString())
+    pipeline.spec.description.output[1].ParseFromString(nms_model._spec.description.output[1].SerializeToString())
+
+    # Update metadata
+    pipeline.spec.specificationVersion = 5
+    pipeline.spec.description.metadata.userDefined.update({
+        'IoU threshold': str(nms.iouThreshold),
+        'Confidence threshold': str(nms.confidenceThreshold)})
+
+    # Save the model
+    model = ct.models.MLModel(pipeline.spec, weights_dir=weights_dir)
+
+    # model.input_description['image'] = 'Input image'
+    model.input_description['iouThreshold'] = f'(optional) IOU threshold override (default: {nms.iouThreshold})'
+    model.input_description['confidenceThreshold'] = \
+        f'(optional) Confidence threshold override (default: {nms.confidenceThreshold})'
+    model.output_description['confidence'] = 'Boxes × Class confidence (see user-defined metadata "classes")'
+    model.output_description['coordinates'] = 'Boxes × [x, y, width, height] (relative to image size)'
+    return model
+
 @resolve_param("pre_process", TransformsFactory())
 @resolve_param("post_process", TransformsFactory())
 def convert_to_coreml(
@@ -128,13 +225,15 @@ def convert_to_coreml(
     traced_model = torch.jit.trace(complete_model, example_inputs, **torch_trace_kwargs)
     logger.info("Tracing the model with the provided inputs...")
     out = traced_model(*example_inputs)  # using * because example_inputs is a list
-    logger.info(f"Inferred output shapes: {[o.shape for o in out]}")
+    # logger.info(f"Inferred output shapes: {[o.shape for o in out]}")
     if export_as_ml_program:
         coreml_model = ct.convert(
             traced_model, convert_to="mlprogram", inputs=[ct.ImageType(name=f"x_{i + 1}", shape=_.shape) for i, _ in enumerate(example_inputs)]
         )
     else:
         coreml_model = ct.convert(traced_model, inputs=[ct.ImageType(name=f"x_{i + 1}", shape=_.shape) for i, _ in enumerate(example_inputs)])
+
+    coreml_model = pipeline_coreml(coreml_model, weights_dir=coreml_model.weights_dir)
 
     spec = coreml_model.get_spec()
     logger.debug(spec.description)
